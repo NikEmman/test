@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="el">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Multi-PDF OCR Parser (Fixed CORS)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/tesseract.min.js"></script>
+    <script
+      async
+      src="https://docs.opencv.org/4.5.4/opencv.js"
+      onload="onOpenCvReady()"
+    ></script>
+
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        max-width: 1100px;
+        margin: 20px auto;
+        background: #f4f7f6;
+        padding: 0 20px;
+      }
+      .card {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+      #drop-zone {
+        border: 3px dashed #3498db;
+        padding: 40px;
+        text-align: center;
+        cursor: pointer;
+        background: #f0f9ff;
+        transition: 0.3s;
+      }
+      #drop-zone:hover {
+        background: #e0f2fe;
+        border-color: #2980b9;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+      }
+      #status {
+        font-weight: bold;
+        color: #2980b9;
+        margin: 10px 0;
+      }
+      #debug-console {
+        width: 100%;
+        height: 500px;
+        background: #1e1e1e;
+        color: #33ff33;
+        font-family: monospace;
+        padding: 15px;
+        border-radius: 8px;
+        font-size: 13px;
+      }
+      #results {
+        font-size: 1.2rem;
+        line-height: 1.8;
+        color: #2c3e50;
+      }
+      .match-badge {
+        background: #27ae60;
+        color: white;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.9rem;
+      }
+      .fail-badge {
+        background: #e74c3c;
+        color: white;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.9rem;
+      }
+      canvas {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Greek Department PDF Parser</h2>
+      <div
+        id="drop-zone"
+        onclick="document.getElementById('file-input').click()"
+      >
+        <strong>Drag PDFs here or Click to Browse</strong>
+        <input
+          type="file"
+          id="file-input"
+          accept="application/pdf"
+          multiple
+          style="display: none"
+        />
+      </div>
+      <div id="status">Status: Loading Libraries...</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>📊 Statistics</h3>
+        <div id="results">Waiting for documents...</div>
+      </div>
+      <div class="card">
+        <h3>🔍 Raw OCR Console</h3>
+        <textarea
+          id="debug-console"
+          readonly
+          placeholder="Raw text will stream here..."
+        ></textarea>
+      </div>
+    </div>
+
+    <canvas id="pdf-canvas"></canvas>
+    <canvas id="proc-canvas"></canvas>
+
+    <script>
+      const DEPARTMENTS = {
+        ΚΟΜΟΤΗΝΗΣ: "Τ.Δ.Ε.Ε. ΚΟΜΟΤΗΝΗΣ",
+        ΣΑΠΩΝ: "Α.Τ. ΣΑΠΩΝ",
+        ΙΑΣΜΟΥ: "Α.Τ. ΙΑΣΜΟΥ",
+        ΑΡΡΙΑΝΩΝ: "Α.Τ. ΑΡΡΙΑΝΩΝ",
+      };
+
+      let totals = {};
+      let grandTotalFromDocs = 0;
+      let cvReady = false;
+
+      // Fix for the Worker Error: Initialize Tesseract with explicit paths
+      const initTesseract = async () => {
+        const worker = await Tesseract.createWorker({
+          workerPath:
+            "https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/worker.min.js",
+          langPath: "https://tessdata.projectnaptha.com/4.0.0",
+          corePath:
+            "https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.2/tesseract-core.wasm.js",
+          logger: (m) => {
+            if (m.status === "recognizing text") {
+              document.getElementById("status").innerText =
+                `Reading: ${Math.round(m.progress * 100)}%`;
+            }
+          },
+        });
+        await worker.loadLanguage("ell");
+        await worker.initialize("ell");
+        await worker.setParameters({
+          tessedit_pageseg_mode: "3", // Fully automatic page segmentation
+          tessedit_char_whitelist: "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ0123456789.- ", // Πρόσθεσα το κενό
+        });
+        return worker;
+      };
+
+      function onOpenCvReady() {
+        cvReady = true;
+        document.getElementById("status").innerText =
+          "System Ready. Please upload files.";
+      }
+
+      document
+        .getElementById("file-input")
+        .addEventListener("change", async (e) => {
+          if (!cvReady) return alert("OpenCV is still loading...");
+          const files = Array.from(e.target.files);
+          if (files.length === 0) return;
+
+          // Reset
+          totals = {
+            "Τ.Δ.Ε.Ε. ΚΟΜΟΤΗΝΗΣ": 0,
+            "Α.Τ. ΣΑΠΩΝ": 0,
+            "Α.Τ. ΙΑΣΜΟΥ": 0,
+            "Α.Τ. ΑΡΡΙΑΝΩΝ": 0,
+          };
+          grandTotalFromDocs = 0;
+          document.getElementById("debug-console").value =
+            "Initializing Worker...\n";
+
+          const worker = await initTesseract();
+
+          for (const file of files) {
+            logDebug(`\n>>> FILE: ${file.name}`);
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer })
+              .promise;
+
+            for (let i = 1; i <= pdf.numPages; i++) {
+              document.getElementById("status").innerText =
+                `Processing ${file.name} (P${i}/${pdf.numPages})`;
+              const page = await pdf.getPage(i);
+
+              // 1. Render & Enhance
+              const canvas = await renderPageToCanvas(page);
+              enhanceForOcr(canvas);
+
+              // 2. OCR
+              const procCanvas = document.getElementById("proc-canvas");
+              const {
+                data: { text },
+              } = await worker.recognize(procCanvas);
+
+              logDebug(`-- Page ${i} Raw Text --\n${text}`);
+              parseLogic(text);
+              // Στο τέλος της επεξεργασίας κάθε αρχείου
+              console.log(
+                `File: ${file.name} - Found so far: ${Object.values(totals).reduce((a, b) => a + b, 0)}`,
+              );
+            }
+          }
+
+          await worker.terminate();
+          renderResults();
+          document.getElementById("status").innerText = "Batch Completed.";
+        });
+
+      async function renderPageToCanvas(page) {
+        const viewport = page.getViewport({ scale: 2.5 });
+        const canvas = document.getElementById("pdf-canvas");
+        const context = canvas.getContext("2d");
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        await page.render({ canvasContext: context, viewport: viewport })
+          .promise;
+        return canvas;
+      }
+      function enhanceForOcr(sourceCanvas) {
+        let src = cv.imread(sourceCanvas);
+        let dst = new cv.Mat();
+
+        // 1. Grayscale & Rotation
+        cv.rotate(src, src, cv.ROTATE_90_COUNTERCLOCKWISE);
+        cv.cvtColor(src, src, cv.COLOR_RGBA2GRAY, 0);
+
+        // 2. Σταθερό Threshold (Όχι Adaptive)
+        // Αυτό θα κάνει τα γράμματα "κοκάλινα" μαύρα σε άσπρο φόντο
+        cv.threshold(src, dst, 150, 255, cv.THRESH_BINARY);
+
+        cv.imshow("proc-canvas", dst);
+        src.delete();
+        dst.delete();
+      }
+      function parseLogic(text) {
+        const lines = text.split("\n");
+        lines.forEach((line) => {
+          const cleanLine = line.toUpperCase().replace(/\s/g, "");
+
+          // Φίλτρο κεφαλίδας & θορύβου (Μην μετράμε τις γραμμές που είναι μόνο ημερομηνίες ή τίτλοι)
+          if (cleanLine.length < 4 || /ΝΕΖΒ|ΠΙΜΑΡ|2026|ΣΕΛΙΔ/.test(cleanLine))
+            return;
+
+          // 1. ΚΟΜΟΤΗΝΗ (Πιάνει: ΤΔΕΕ, ΤΑΕΕ, ΤΛΕΕ, ΤΕΕ, ΚΟΜΟ, ΚΟΙΛΟ, ΚΠΟΜΟ, ΚΝΗΣ, ΚΓΛΠΓ, ΚΟΠΗ, ΤΛΟΤΗΝΗ, ΚΟΟΝΗ)
+          if (
+            /Τ[ΔΑΛΟΕ]{1,2}ΕΕ|[ΚΓ][Ο0Λ][ΠΤΛΓ]ΟΤΗΝΗ|Κ[Ο0]ΤΝ|ΚΜΤΝ|Κ[Ο0]Σ|ΚΤΝΗ|ΜΟΤΗ|ΚΝΗΣ|ΚΠΟΜΟ|ΚΟΠΗ|ΚΟΟΝΗ|ΚΟΝΟΤΝ/.test(
+              cleanLine,
+            )
+          ) {
+            totals["Τ.Δ.Ε.Ε. ΚΟΜΟΤΗΝΗΣ"]++;
+          }
+          // 2. ΣΑΠΕΣ (Πιάνει: ΣΑΠ, ΞΑΠ, ΣΠΩΝ, ΣΠΝ, ΑΤΣΠ, ΑΣΑΠ, Α-ΣΑΠ, ΣΠΝ, ΣΠΝ)
+          else if (/ΣΑΠ|ΞΑΠ|ΣΠ[ΩΟ]Ν|ΣΠΝ|ΑΤΣΠ|ΑΣΑΠ|Α-ΣΑΠ/.test(cleanLine)) {
+            totals["Α.Τ. ΣΑΠΩΝ"]++;
+          }
+          // 3. ΙΑΣΜΟΣ (Πιάνει: ΙΑΣΜ, ΙΑΣΝ, ΑΣΜΟ, Α-ΜΟ, ΙΑΣΜΟΟ)
+          else if (/[Ι1]ΑΣ[ΜΝ]|ΑΣ[ΜΝ][Ο0]|Α-Μ[Ο0]|ΙΑΣΜΟΟ/.test(cleanLine)) {
+            totals["Α.Τ. ΙΑΣΜΟΥ"]++;
+          }
+          // 4. ΑΡΡΙΑΝΑ (Πιάνει: ΑΡΡΙΑ, ΑΡΙΑΝ, ΑΤΑΡΡ, ΑΡΕΙΑΝ, ΑΡΡΙΑΝΟΝ, ΑΡΡΙΑΝΟ)
+          else if (
+            /ΑΡ[ΡΙΑ]+ΝΑ|ΑΡΙΑΝ|ΑΤΑΡΡ|ΑΡΕΙΑΝ|ΑΡΡΝ|ΑΡΡΙΑΝΟ/.test(cleanLine)
+          ) {
+            totals["Α.Τ. ΑΡΡΙΑΝΩΝ"]++;
+          }
+        });
+      }
+      function logDebug(msg) {
+        const consoleEl = document.getElementById("debug-console");
+        consoleEl.value += msg + "\n";
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      }
+
+      function renderResults() {
+        let sum = 0;
+        let html = "<ul>";
+        for (let d in totals) {
+          html += `<li>${d}: <strong>${totals[d]} items</strong></li>`;
+          sum += totals[d];
+        }
+        html += "</ul><hr>";
+        html += `<p>Calculated Sum: <strong>${sum}</strong></p>`;
+        html += `<p>Doc Grand Total: <strong>${grandTotalFromDocs}</strong></p>`;
+
+        if (sum === grandTotalFromDocs && sum > 0) {
+          html += `<span class="match-badge">✅ TOTALS MATCH</span>`;
+        } else {
+          html += `<span class="fail-badge">⚠️ DISCREPANCY DETECTED</span>`;
+        }
+        document.getElementById("results").innerHTML = html;
+      }
+
+      window.onload = () => {
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js";
+      };
+    </script>
+  </body>
+</html>
